@@ -157,9 +157,9 @@ export default function App() {
           <StepNumber n={1} title="Your files" />
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
             <FileField
-              label="Transaction screenshot"
-              hint="PNG, JPEG, GIF or WebP, up to 5 MB"
-              accept="image/*"
+              label="Statement or screenshot"
+              hint="A transactions PDF, or a PNG / JPEG / GIF / WebP screenshot"
+              accept="image/*,.pdf,application/pdf"
               file={screenshot}
               preview
               onChange={onPick(setScreenshot)}
@@ -201,7 +201,7 @@ export default function App() {
               disabled={!readyToAnalyze || busy !== null}
               className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
             >
-              {busy === "analyze" ? "Reading screenshot…" : "Read transactions"}
+              {busy === "analyze" ? "Reading statement…" : "Read transactions"}
             </button>
           </div>
         </Card>
@@ -209,6 +209,7 @@ export default function App() {
         {analysis && (
           <Card>
             <StepNumber n={2} title="Review the transactions" />
+            <SourceNote analysis={analysis} />
             {analysis.warnings.length > 0 && (
               <div className="mt-3 space-y-2">
                 {analysis.warnings.map((w, i) => (
@@ -323,6 +324,42 @@ export default function App() {
   );
 }
 
+// How the rows were read, and whether the statement's own arithmetic agrees with them.
+// For a text PDF this is a positive check ("the balances add up"), which is the strongest
+// reassurance the app can give — stronger than any vision-model confidence wording.
+function SourceNote({ analysis }) {
+  const check = analysis.balance_check;
+  const source = analysis.source;
+
+  if (check?.checked) {
+    return (
+      <div className="mt-3">
+        {check.ok ? (
+          <Banner
+            tone="info"
+            body="Read from the PDF's text, and every printed balance in the statement adds up — nothing appears to have been missed."
+          />
+        ) : (
+          <Banner tone="warning" title="The statement's balances don't add up" body={check.message} />
+        )}
+      </div>
+    );
+  }
+
+  if (source === "pdf-vision") {
+    return (
+      <div className="mt-3">
+        <Banner
+          tone="warning"
+          body="This PDF is a scan with no text layer, so it was read with the vision model. Check the rows against the PDF before applying."
+        />
+      </div>
+    );
+  }
+
+  return null;
+}
+
 function PreviewNote({ target, rows, compact }) {
   if (!target) {
     return (
@@ -370,6 +407,10 @@ function FileField({ label, hint, accept, file, onChange, preview }) {
   const inputRef = useRef(null);
   const [url, setUrl] = useState(null);
 
+  const isPdf =
+    Boolean(file) &&
+    (file.type === "application/pdf" || /\.pdf$/i.test(file.name || ""));
+
   useEffect(() => {
     if (!preview || !file || !file.type?.startsWith("image/")) {
       setUrl(null);
@@ -404,6 +445,12 @@ function FileField({ label, hint, accept, file, onChange, preview }) {
           alt="Screenshot preview"
           className="mt-3 max-h-40 w-full rounded border border-slate-200 object-contain"
         />
+      )}
+
+      {isPdf && (
+        <div className="mt-3 rounded border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600">
+          PDF — will be read from its text, so the amounts come through exactly.
+        </div>
       )}
 
       <div className="mt-auto pt-3">

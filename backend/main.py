@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Annotated
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -35,11 +37,18 @@ import extract
 import history
 import insights
 import ledger
+import statement_pdf
 import workbook
 
 MAX_WORKBOOK_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_CSV_BYTES = 5 * 1024 * 1024
+# Statements are bigger than screenshots: a multi-page PDF with a text layer is parsed
+# locally, so the limit here is about upload size, not model tokens.
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+# A scanned PDF is rendered page by page at ~2x; each page must stay under the vision
+# model's own image limit, which the render path enforces.
+MAX_PDF_PAGES_VISION = statement_pdf.MAX_VISION_PAGES
 
 store = history.Database()
 book = ledger.Ledger()
@@ -81,6 +90,15 @@ class Candidate(BaseModel):
     raw_value: str | None = None
 
 
+class BalanceCheck(BaseModel):
+    """Whether the statement's own running balance agrees with the rows read."""
+
+    checked: bool
+    ok: bool
+    mismatches: int = 0
+    message: str = ""
+
+
 class AnalyzeResult(BaseModel):
     account_hint: str | None = None
     transactions: list[Tx]
@@ -88,6 +106,9 @@ class AnalyzeResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     duplicates: list[str] = Field(default_factory=list)
     total: str
+    # "pdf-text" | "pdf-vision" | "image" — lets the UI say how the rows were read.
+    source: str = "image"
+    balance_check: BalanceCheck | None = None
 
 
 class HistoryEntry(BaseModel):
@@ -286,6 +307,156 @@ def _as_date(value: str | None) -> date:
     return parsed
 
 
+def _statement_detail(exc: statement_pdf.StatementError) -> str:
+    """A 422 message that says what the reader actually saw.
+
+    A bare "no rows found" is impossible to act on from outside: it is the same message
+    for an empty file, a scan, and a table whose column shape the reader did not expect.
+    Appending the first lines it read turns the error into a diagnosis.
+    """
+    parts = [exc.message]
+    if exc.detail:
+        parts.append(exc.detail)
+    if exc.sample:
+        clipped = exc.sample if len(exc.sample) <= 600 else exc.sample[:600] + "…"
+        parts.append("The first lines the app read were:\n" + clipped)
+    return "\n\n".join(parts)
+
+
+def _extract_statement(data: bytes, content_type: str | None) -> tuple[dict, list[str]]:
+    """Read an image *or* a PDF into transactions, choosing the most exact path.
+
+    A PDF with a text layer is parsed deterministically — exact digits, no model call.
+    Only a PDF with no text (a scan) is rendered and sent to the vision model, page by
+    page. Returns the extraction plus any warnings the caller should surface.
+    """
+    if data[:5] == b"%PDF-":
+        # Rebuild lines from word coordinates first: some PDFs put every word on its own
+        # line in the text layer, which makes the line-based extraction useless even
+        # though the page looks like a table. Fall back to plain text only if the
+        # positional pass yields nothing.
+        text = statement_pdf.extract_positional_text(data)
+        if not text.strip():
+            text = statement_pdf.extract_text(data)
+        text_failure = None
+        if text.strip():
+            try:
+                parsed = statement_pdf.parse_statement_text(text)
+            except statement_pdf.StatementError as exc:
+                # The strict reader wants a date at the start of a line and the money at
+                # the end. Before falling back to the (slower, costlier) model, try a
+                # permissive pass: find a date and amounts anywhere on the line. Its rows
+                # are only trusted if the running balance agrees, so a misread cannot slip
+                # through silently.
+                try:
+                    parsed = statement_pdf.parse_lenient(text)
+                except statement_pdf.StatementError:
+                    parsed = None
+                if parsed is None or not parsed["rows"]:
+                    # Keep the whole exception, not str(exc): the message alone discards
+                    # the sample of what was read, which is what makes this diagnosable.
+                    text_failure = exc
+                else:
+                    parsed["warnings"] = ["Read with a permissive parser. Check the rows "
+                                          "against the PDF before applying."] + list(parsed["warnings"])
+                    return (
+                        {
+                            "account_hint": None,
+                            "transactions": [
+                                {
+                                    "date": row["date"],
+                                    "description": row["description"],
+                                    "amount": Decimal(row["amount"]),
+                                    "currency": row["currency"],
+                                }
+                                for row in parsed["rows"]
+                            ],
+                            "truncated": False,
+                            "balance_check": parsed["balance_check"],
+                            "source": "pdf-lenient",
+                        },
+                        list(parsed["warnings"]),
+                    )
+            else:
+                rows = parsed["rows"]
+                return (
+                    {
+                        "account_hint": None,
+                        "transactions": [
+                            {
+                                "date": row["date"],
+                                "description": row["description"],
+                                # parse_statement_text already hands back Decimal amounts.
+                                "amount": Decimal(row["amount"]),
+                                "currency": row["currency"],
+                            }
+                            for row in rows
+                        ],
+                        "truncated": False,
+                        "balance_check": parsed["balance_check"],
+                        "source": "pdf-text",
+                    },
+                    list(parsed["warnings"]),
+                )
+
+        # No usable text layer (a scan, or a layout the reader could not follow). Render
+        # the pages and let the model read them.
+        pages = statement_pdf.render_pages(data)
+        if not pages:
+            raise statement_pdf.StatementError(
+                "That PDF has no text and no renderable pages, so it could not be read."
+            )
+        merged: dict = {"account_hint": None, "transactions": [], "truncated": False,
+                        "source": "pdf-vision"}
+        if text_failure:
+            warnings = [
+                "This PDF's text is in a layout the app's table reader could not follow, so "
+                "it was read with the vision model instead. Check the rows carefully."
+            ]
+        else:
+            warnings = [
+                f"This PDF has no text layer (it looks like a scan), so it was read with the "
+                f"vision model from {len(pages)} page(s). Check the rows against the PDF."
+            ]
+        # Read the pages concurrently. Sequentially, eight pages at up to 120s each can
+        # outlast the ingress timeout, which surfaces to the user as a bare 504.
+        with ThreadPoolExecutor(max_workers=min(4, len(pages))) as pool:
+            futures = [pool.submit(extract.extract, page, "image/png") for page in pages]
+            results = []
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except extract.ExtractionError:
+                    # If the fallback itself cannot run (no API key, provider down) and we
+                    # only got here because the text layout was unrecognised, re-raise the
+                    # layout error intact. It already carries the sample of what was read,
+                    # which is what makes the failure diagnosable; wrapping it in a new
+                    # error would throw that away.
+                    if text_failure is not None:
+                        raise text_failure from None
+                    raise
+        for page_result in results:
+            merged["transactions"].extend(page_result["transactions"])
+            merged["account_hint"] = merged["account_hint"] or page_result.get("account_hint")
+            merged["truncated"] = merged["truncated"] or page_result.get("truncated", False)
+        if statement_pdf.page_count(data) > len(pages):
+            warnings.append(
+                f"Only the first {len(pages)} pages were read. Split the statement and "
+                "upload the rest."
+            )
+        if not merged["transactions"] and text_failure is not None:
+            # Both readers came back empty. The text reader's error carries the sample of
+            # what it saw, which is the only actionable evidence here — surface it rather
+            # than the caller reporting a bare "no transactions found".
+            raise text_failure
+        return merged, warnings
+
+    result = extract.extract(data, content_type)
+    result["source"] = "image"
+    result["balance_check"] = {"checked": False, "ok": True, "mismatches": 0, "message": ""}
+    return result, []
+
+
 def _read_upload(file: UploadFile, limit: int, what: str) -> bytes:
     data = file.file.read(limit + 1)
     if not data:
@@ -463,21 +634,34 @@ async def analyze(
     workbook_file: Annotated[UploadFile, File()],
     label: Annotated[str, Form()] = "UOB One",
 ):
-    """Extract transactions and propose which cell to append to. Writes nothing."""
-    image_bytes = _read_upload(screenshot, MAX_IMAGE_BYTES, "screenshot")
+    """Extract transactions and propose which cell to append to. Writes nothing.
+
+    The uploaded file may be an image or a statement PDF; both arrive as ``screenshot``
+    so existing clients (and the form field name) keep working.
+    """
+    image_bytes = _read_upload(screenshot, MAX_UPLOAD_BYTES, "statement")
     workbook_bytes = _read_upload(workbook_file, MAX_WORKBOOK_BYTES, "workbook")
 
     try:
-        result = extract.extract(image_bytes, screenshot.content_type)
+        # Blocking (pdfplumber + model calls). Run it in a worker thread so the event
+        # loop keeps serving /health and other requests while a statement is read; on the
+        # loop it would freeze the whole app for the duration of the model call.
+        result, source_warnings = await run_in_threadpool(
+            _extract_statement, image_bytes, screenshot.content_type
+        )
     except extract.ExtractionError as exc:
         raise HTTPException(422, str(exc)) from exc
+    except statement_pdf.StatementError as exc:
+        raise HTTPException(422, _statement_detail(exc)) from exc
 
     try:
         candidates = workbook.find_candidates(workbook_bytes, label)
     except Exception as exc:  # noqa: BLE001 - openpyxl raises a variety of errors
         raise HTTPException(400, f"Could not read that workbook: {exc}") from exc
 
-    warnings: list[str] = []
+    # Warnings from the reader itself come first: a missed row matters more than a
+    # mismatched account name.
+    warnings: list[str] = list(source_warnings)
     if result["account_hint"] and label.strip():
         # Compare on letters-and-digits only: the model may drop a space ("UOBOne
         # Account"), which shouldn't read as a different account.
@@ -493,7 +677,7 @@ async def analyze(
             f'No row in the workbook contains "{label}", so there is no cell to append to yet.'
         )
     if not result["transactions"]:
-        warnings.append("No transactions were found in that screenshot.")
+        warnings.append("No transactions were found in that file.")
     if result.get("truncated"):
         warnings.append(
             "The model hit its output limit, so this list may be incomplete. Check the "
@@ -538,6 +722,8 @@ async def analyze(
         warnings=warnings,
         duplicates=duplicates,
         total=workbook.format_amount(total),
+        source=result.get("source", "image"),
+        balance_check=result.get("balance_check"),
     )
 
 
@@ -559,14 +745,18 @@ async def apply(
 
     rows = _parse_rows(rows_json)
     if not rows:
-        # No reviewed rows supplied: extract fresh from the screenshot.
+        # No reviewed rows supplied: extract fresh from the upload (image or PDF).
         if screenshot is None:
             raise HTTPException(400, "There are no transactions to apply.")
-        image_bytes = _read_upload(screenshot, MAX_IMAGE_BYTES, "screenshot")
+        image_bytes = _read_upload(screenshot, MAX_UPLOAD_BYTES, "statement")
         try:
-            extracted = extract.extract(image_bytes, screenshot.content_type)
+            extracted, _ = await run_in_threadpool(
+                _extract_statement, image_bytes, screenshot.content_type
+            )
         except extract.ExtractionError as exc:
             raise HTTPException(422, str(exc)) from exc
+        except statement_pdf.StatementError as exc:
+            raise HTTPException(422, _statement_detail(exc)) from exc
         rows = [
             RowIn(
                 date=row["date"],
@@ -703,6 +893,57 @@ async def post_affordability(request: Request, body: AffordabilityRequest):
 # ------------------------------------------------------------------------- ledger
 
 
+@app.post("/api/pdf/inspect")
+async def inspect_pdf(
+    request: Request,
+    file: Annotated[UploadFile, File()],
+    lines: int = 40,
+):
+    """Report what the statement reader sees in a PDF. Nothing is stored.
+
+    Exists because a failed parse is otherwise indistinguishable from a scanned PDF or an
+    empty file: the user gets the same message either way. This returns the extracted
+    text, the row count, and the balance check, so a layout that does not parse can be
+    diagnosed without sending the statement anywhere.
+    """
+    data = _read_upload(file, MAX_UPLOAD_BYTES, "PDF")
+    if not statement_pdf.is_pdf(data):
+        raise HTTPException(400, "That is not a PDF.")
+
+    report: dict = {"bytes": len(data), "pages": statement_pdf.page_count(data)}
+    try:
+        positional = statement_pdf.extract_positional_text(data)
+    except statement_pdf.StatementError as exc:
+        report["positional_error"] = str(exc)
+        positional = ""
+    try:
+        plain = statement_pdf.extract_text(data)
+    except statement_pdf.StatementError as exc:
+        report["text_error"] = str(exc)
+        plain = ""
+
+    report["text_chars"] = len(plain.strip())
+    report["head"] = "\n".join(
+        [line for line in (positional or plain).splitlines() if line.strip()][: max(1, min(lines, 200))]
+    )
+
+    for label, text in (("positional", positional), ("plain", plain)):
+        if not text.strip():
+            report[f"{label}_rows"] = 0
+            continue
+        try:
+            parsed = statement_pdf.parse_statement_text(text)
+        except statement_pdf.StatementError as exc:
+            report[f"{label}_rows"] = 0
+            report[f"{label}_error"] = exc.message
+            report[f"{label}_detail"] = exc.detail
+        else:
+            report[f"{label}_rows"] = len(parsed["rows"])
+            report[f"{label}_balance_ok"] = parsed["balance_check"]["ok"]
+
+    return report
+
+
 @app.post("/api/ledger/import", response_model=ImportResult)
 async def import_csv(
     request: Request,
@@ -712,23 +953,59 @@ async def import_csv(
     currency: Annotated[str, Form()] = "SGD",
     commit: Annotated[bool, Form()] = False,
 ):
-    """Parse a transactions CSV; store it only when ``commit`` is true.
+    """Parse a transactions CSV *or statement PDF*; store it only when ``commit`` is true.
 
     Preview-then-commit is deliberate: the column guesses and the per-line errors are
     what the user needs to see *before* the numbers land in their history.
-    """
-    raw = ""
-    if file is not None and file.filename:
-        raw = _read_upload(file, MAX_CSV_BYTES, "CSV file").decode("utf-8-sig", errors="replace")
-    elif text.strip():
-        raw = text
-    else:
-        raise HTTPException(400, "Attach a CSV file, or paste its contents.")
 
-    try:
-        parsed = ledger.parse_csv(raw, default_currency=currency)
-    except ledger.ImportError_ as exc:
-        raise HTTPException(422, str(exc)) from exc
+    A PDF goes through the statement reader (exact text parse, or vision for a scan) and
+    then the same preview/commit path as a CSV, so history can be bulk-loaded from the
+    file the bank actually gives you.
+    """
+    uploaded = file is not None and bool(file.filename)
+    payload = _read_upload(file, MAX_UPLOAD_BYTES, "file") if uploaded else b""
+
+    if uploaded and statement_pdf.is_pdf(payload):
+        try:
+            extracted, reader_warnings = await run_in_threadpool(
+                _extract_statement, payload, file.content_type
+            )
+        except statement_pdf.StatementError as exc:
+            raise HTTPException(422, _statement_detail(exc)) from exc
+        except extract.ExtractionError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        # A PDF's date order is the statement's, so hand it to the import pipeline with
+        # the clock icon: rows already stored are skipped, the rest are added.
+        parsed = {
+            "rows": [
+                {
+                    "date": row["date"],
+                    "description": row["description"],
+                    "amount": workbook.format_amount(row["amount"]),
+                    "currency": row["currency"],
+                }
+                for row in extracted["transactions"]
+            ],
+            "errors": list(reader_warnings),
+            "columns": {"source": "statement PDF"},
+        }
+        if not parsed["rows"]:
+            return ImportResult(
+                committed=False,
+                parsed=0,
+                added=0,
+                skipped=0,
+                errors=parsed["errors"] or ["No transactions were found in that PDF."],
+                columns={},
+            )
+    elif uploaded or text.strip():
+        raw = payload.decode("utf-8-sig", errors="replace") if uploaded else text
+        try:
+            parsed = ledger.parse_csv(raw, default_currency=currency)
+        except ledger.ImportError_ as exc:
+            raise HTTPException(422, str(exc)) from exc
+    else:
+        raise HTTPException(400, "Attach a CSV or PDF file, or paste the CSV contents.")
 
     if commit:
         result = await book.add(_actor(request), account, parsed["rows"], source="import")

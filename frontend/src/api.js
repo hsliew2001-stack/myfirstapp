@@ -1,8 +1,19 @@
 // Same-origin API calls. The ingress routes /api to the backend; Vite's dev server
 // proxies the same paths to :8000 locally, so nothing absolute is ever needed here.
 
+// Gateway errors arrive as a bare status with no JSON body, so a stack trace of numbers
+// is all the user would otherwise see. Say what it means and what to do instead.
+const GATEWAY = {
+  502: "The app is restarting or unreachable. Wait a moment and try again.",
+  503: "The app is temporarily unavailable. Try again shortly.",
+  504:
+    "Reading that file took longer than the server allows, so the request was cut off. " +
+    "A scanned or very long PDF is the usual cause — try a statement with fewer pages, " +
+    "upload a page as a screenshot, or import the transactions as a CSV instead.",
+};
+
 async function fail(response) {
-  let detail = `Request failed (${response.status}).`;
+  let detail = GATEWAY[response.status] || `Request failed (${response.status}).`;
   try {
     const body = await response.json();
     if (typeof body?.detail === "string") detail = body.detail;
@@ -10,7 +21,7 @@ async function fail(response) {
       detail = body.detail.map((d) => d.msg ?? String(d)).join("; ");
     }
   } catch {
-    // Non-JSON error body — keep the status-based message.
+    // Non-JSON error body (typically an ingress 502/504) — keep the status-based message.
   }
   return new Error(detail);
 }

@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Statement to Spreadsheet",
-    "description": "Reads bank transaction screenshots with OpenRouter vision models, appends the signed amounts onto an account-balance formula in an Excel workbook, and keeps a per-user transaction history from which it detects recurring bills and projects the balance forward.",
-    "version": "2.0.0"
+    "description": "Reads bank transaction screenshots and statement PDFs, appends the signed amounts onto an account-balance formula in an Excel workbook, and keeps a per-user transaction history from which it detects recurring bills and projects the balance forward.",
+    "version": "2.1.0"
   },
   "paths": {
     "/health": {
@@ -65,8 +65,8 @@
     },
     "/api/analyze": {
       "post": {
-        "summary": "Read a bank screenshot and propose which balance cell to update.",
-        "description": "Sends the image to an OpenRouter vision model, returns the signed transactions, warns about duplicates already applied, and locates candidate balance cells in the supplied workbook. Writes nothing and changes nothing.",
+        "summary": "Read a bank statement (image or PDF) and propose the balance cell to update.",
+        "description": "Reads a bank statement from an uploaded image or PDF, returns the signed transactions, warns about duplicates already applied, and locates candidate balance cells in the supplied workbook. A PDF with a text layer is parsed exactly (no model call) and its printed running balances are checked; a scanned PDF is rendered and read with the vision model. Writes nothing and changes nothing.",
         "operationId": "analyze_api_analyze_post",
         "requestBody": {
           "content": {
@@ -369,8 +369,8 @@
     },
     "/api/ledger/import": {
       "post": {
-        "summary": "Parse a transactions CSV, optionally storing it.",
-        "description": "Detects the date / description / amount columns (or separate debit and credit columns), reports per-line problems, and stores the rows only when commit is true. Rows already stored are skipped by fingerprint, so re-importing overlapping history is a no-op.",
+        "summary": "Parse a transactions CSV or statement PDF, optionally storing it.",
+        "description": "Parses a transactions CSV or a statement PDF, reports per-line problems, and stores the rows only when commit is true. A PDF goes through the statement reader (exact text parse, or the vision model for a scan). Rows already stored are skipped by fingerprint, so re-importing overlapping history is a no-op.",
         "operationId": "import_csv_api_ledger_import_post",
         "requestBody": {
           "content": {
@@ -677,6 +677,26 @@
           "total": {
             "type": "string",
             "title": "Total"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "image",
+              "pdf-text",
+              "pdf-vision"
+            ],
+            "default": "image",
+            "description": "How the rows were read: a screenshot/photo via the vision model, a PDF's own text layer (exact), or a scanned PDF rendered to images and read by the vision model."
+          },
+          "balance_check": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BalanceCheck"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -1674,6 +1694,31 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "BalanceCheck": {
+        "type": "object",
+        "required": [
+          "checked",
+          "ok"
+        ],
+        "description": "Whether the statement's own running balance agrees with the rows that were read. Only present for a PDF; a mismatch means a row was probably missed.",
+        "properties": {
+          "checked": {
+            "type": "boolean",
+            "description": "False when the statement printed no balance column, so nothing could be verified."
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "mismatches": {
+            "type": "integer",
+            "default": 0
+          },
+          "message": {
+            "type": "string",
+            "default": ""
+          }
+        }
       }
     }
   },

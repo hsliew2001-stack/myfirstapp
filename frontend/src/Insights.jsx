@@ -443,15 +443,15 @@ function ImportPanel({ onImported }) {
     <Card>
       <SectionHeading
         title="Import past transactions"
-        hint="A CSV exported from your bank. Nothing is stored until you confirm."
+        hint="A CSV export or a statement PDF from your bank. Nothing is stored until you confirm."
       />
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         <label className="block">
-          <span className="text-xs font-medium text-slate-600">CSV file</span>
+          <span className="text-xs font-medium text-slate-600">CSV or PDF file</span>
           <input
             ref={inputRef}
             type="file"
-            accept=".csv,text/csv"
+            accept=".csv,text/csv,.pdf,application/pdf"
             onChange={(e) => setFile(e.target.files?.[0] ?? null)}
             className="mt-1 block w-full text-sm text-slate-600 file:mr-3 file:rounded-md file:border-0 file:bg-slate-900 file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-white"
           />

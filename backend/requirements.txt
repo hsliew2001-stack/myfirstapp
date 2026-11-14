@@ -5,3 +5,5 @@ openpyxl>=3.1.5             # reads the workbook and validates the patched outpu
 httpx>=0.27                 # calls the OpenRouter chat-completions endpoint
 asyncmy>=0.2.9              # OceanBase / MySQL-wire driver (NOT asyncpg)
 pydantic>=2.9
+pdfplumber>=0.11            # statement PDF text layer (exact digits, no model call)
+pypdfium2>=4.30             # renders a scanned PDF's pages for the vision fallback

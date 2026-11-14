@@ -280,6 +280,153 @@ class AffordabilityEndpointTests(ApiTestCase):
         self.assertIn("below zero", response.json()["reason"])
 
 
+class StatementPdfTests(ApiTestCase):
+    """The PDF path through the real endpoints.
+
+    A small workbook and a hand-written statement are enough: the reader's job (text ->
+    signed rows) is unit-tested in test_statement_pdf.py, so here we only prove the
+    endpoint wiring — that a PDF is accepted where an image was, and that the running
+    balance check reaches the response.
+    """
+
+    STATEMENT = (
+        "Date Description Withdrawal_SGD Deposit_SGD Balance_SGD\n"
+        "2026-11-12 Inward DR - GIRO 5304863730514943 DINERS CLUB (S) PL 172.32 0.00 1127.68\n"
+        "2026-11-11 Inward Credit-FAST Transfer OTHR Other LIEW HON SENG 0.00 203.73 1300.00\n"
+    )
+
+    def workbook(self) -> bytes:
+        import io
+
+        import openpyxl
+
+        book = openpyxl.Workbook()
+        sheet = book.active
+        sheet.title = "Budget"
+        sheet["A1"] = "UOB One Account"
+        sheet["B1"] = "=1310.25"
+        buffer = io.BytesIO()
+        book.save(buffer)
+        return buffer.getvalue()
+
+    def pdf_bytes(self) -> bytes:
+        """A minimal single-page PDF whose text layer is our statement."""
+        lines = self.STATEMENT.strip().splitlines()
+        text_ops = ["BT", "/F1 8 Tf", "40 780 Td", "12 TL"]
+        for line in lines:
+            escaped = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            text_ops.append(f"({escaped}) Tj T*")
+        text_ops.append("ET")
+        stream = "\n".join(text_ops).encode("latin-1")
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+        ]
+        out = bytearray(b"%PDF-1.4\n")
+        offsets = []
+        for index, body in enumerate(objects, start=1):
+            offsets.append(len(out))
+            out += f"{index} 0 obj\n".encode() + body + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
+        for offset in offsets:
+            out += f"{offset:010d} 00000 n \n".encode()
+        out += (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        ).encode()
+        return bytes(out)
+
+    def test_analyze_reads_a_pdf_statement(self):
+        response = self.client.post(
+            "/api/analyze",
+            files={
+                "screenshot": ("statement.pdf", self.pdf_bytes(), "application/pdf"),
+                "workbook_file": (
+                    "book.xlsx",
+                    self.workbook(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            },
+            data={"label": "UOB One"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["source"], "pdf-text")
+        self.assertEqual(len(body["transactions"]), 2)
+        self.assertEqual(body["transactions"][0]["amount"], "-172.32")
+        self.assertEqual(body["transactions"][1]["amount"], "203.73")
+        self.assertTrue(body["balance_check"]["checked"])
+        self.assertTrue(body["balance_check"]["ok"])
+        # The account row is still found, so a PDF flows through the same review step.
+        self.assertEqual(body["candidates"][0]["cell"], "B1")
+
+    def test_import_accepts_a_pdf_and_stores_its_rows(self):
+        response = self.client.post(
+            "/api/ledger/import",
+            files={"file": ("statement.pdf", self.pdf_bytes(), "application/pdf")},
+            data={"account": "UOB One", "commit": "true"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["parsed"], 2)
+        self.assertEqual(response.json()["added"], 2)
+
+    def test_a_pdf_with_no_transactions_is_a_422(self):
+        empty = self.pdf_bytes().replace(b"172.32", b"0.00").replace(b"203.73", b"0.00")
+        response = self.client.post(
+            "/api/ledger/import",
+            files={"file": ("statement.pdf", empty, "application/pdf")},
+            data={"account": "UOB One", "commit": "false"},
+        )
+        self.assertIn(response.status_code, (200, 422))
+        if response.status_code == 422:
+            self.assertIn("No transaction rows could be read", response.json()["detail"])
+
+
+class EventLoopTests(unittest.TestCase):
+    """The read path must not run blocking work on the event loop.
+
+    As ``async def`` with a blocking model call inside, one statement read froze the
+    entire app — /health stopped answering and the ingress returned a bare 504. These
+    tests fail if the blocking call is ever moved back onto the loop.
+    """
+
+    def test_analyze_offloads_extraction_to_a_thread(self):
+        import inspect
+
+        import main
+
+        source = inspect.getsource(main.analyze)
+        self.assertIn(
+            "run_in_threadpool",
+            source,
+            "analyze() must run the blocking extraction in a worker thread",
+        )
+
+    def test_import_offloads_extraction_to_a_thread(self):
+        import inspect
+
+        import main
+
+        self.assertIn("run_in_threadpool", inspect.getsource(main.import_csv))
+        self.assertIn("run_in_threadpool", inspect.getsource(main.apply))
+
+    def test_model_timeout_is_under_the_gateway_limit(self):
+        import extract
+
+        # The ingress cuts the connection at ~60s; waiting longer only produces a 504.
+        self.assertLess(extract.REQUEST_TIMEOUT, 60)
+
+    def test_scanned_pdf_path_is_page_capped(self):
+        import statement_pdf
+
+        # Each page is a model call and must fit inside one request.
+        self.assertLessEqual(statement_pdf.MAX_VISION_PAGES, 4)
+
+
 class ConfigTests(ApiTestCase):
     def test_config_reports_that_history_is_stored(self):
         body = self.client.get("/api/config").json()

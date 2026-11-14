@@ -28,7 +28,11 @@ import httpx
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free")
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-REQUEST_TIMEOUT = 120.0
+#: The ingress in front of the app gives up at roughly 60 seconds and returns a bare 504
+#: with no detail. Waiting longer than that here cannot help the user — the connection is
+#: already gone — so the model call is bounded well under it. A slow provider then produces
+#: an actionable "took too long" message instead of an opaque gateway timeout.
+REQUEST_TIMEOUT = 45.0
 
 # Vision needs a raster format; check magic bytes rather than trusting the filename.
 _MEDIA_TYPES = {
@@ -203,7 +207,9 @@ def _post(body: dict, key: str) -> dict:
             response = client.post(OPENROUTER_URL, headers=_headers(key), json=body)
     except httpx.TimeoutException as exc:
         raise ExtractionError(
-            "OpenRouter did not respond in time. Try again, or use a smaller screenshot."
+            "The vision model did not respond within "
+            f"{int(REQUEST_TIMEOUT)} seconds. Free models are often busy — try again, "
+            "or upload a smaller image."
         ) from exc
     except httpx.HTTPError as exc:
         raise ExtractionError("Could not reach OpenRouter. Check the app's network access.") from exc
