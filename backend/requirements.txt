@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12    # multipart/form-data uploads (File/Form params)
+openpyxl>=3.1.5             # reads the workbook and validates the patched output
+httpx>=0.27                 # calls the OpenRouter chat-completions endpoint
+asyncmy>=0.2.9              # OceanBase / MySQL-wire driver (NOT asyncpg)
+pydantic>=2.9

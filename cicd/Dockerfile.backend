@@ -1,0 +1,17 @@
+# Backend image for Substrait. Built from the REPO ROOT, so COPY paths are repo-relative.
+# Contract: EXPOSE 8000, serve GET /health (readiness probe), API under /api.
+FROM python:3.12-slim
+# Apply the distro's security updates on every build. The platform scans OS packages with
+# Trivy: a finding with a published fix BLOCKS promotion to production. Keep this directly
+# under the FROM — its cache key is the base image digest, so it re-runs when the base moves.
+RUN apt-get update \
+ && apt-get upgrade -y \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY backend/requirements.txt .
+# Wheels-only: this slim image has no compiler, so a dep without a cp312 wheel fails fast
+# and legibly here instead of dying in a cryptic gcc build.
+RUN pip install --no-cache-dir --only-binary=:all: -r requirements.txt
+COPY backend/ .
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

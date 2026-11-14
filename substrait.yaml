@@ -1,0 +1,15 @@
+description: >
+  Reads a bank transaction screenshot with OpenRouter vision models and appends each signed amount
+  onto the balance formula of a chosen account row in an Excel workbook (for example
+  "=1310.25" becomes "=1310.25+203.73-172.32"), then hands the updated .xlsx back for
+  download. It also stores the transactions you apply or import from a CSV, and from that
+  history detects recurring bills and income and projects your balance forward — including
+  a "can I afford this?" check against the whole projection. Built for people who keep a
+  personal budget spreadsheet and reconcile it by hand from their banking app.
+
+# The audit trail and the "you already entered this transaction" check need a database.
+# OceanBase is the platform's backed-up, HA option and is MySQL-wire compatible.
+database: oceanbase
+# Skill/plugin version this app was last deployed with — stamped by
+# /substrait:deploy; do not edit by hand.
+scaffold_version: 2026.09.22.075110

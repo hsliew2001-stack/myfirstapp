@@ -1,0 +1,1686 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Statement to Spreadsheet",
+    "description": "Reads bank transaction screenshots with OpenRouter vision models, appends the signed amounts onto an account-balance formula in an Excel workbook, and keeps a per-user transaction history from which it detects recurring bills and projects the balance forward.",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness probe for the platform.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        },
+        "description": "Returns 200 when the backend is up. Used by the platform's health check."
+      }
+    },
+    "/api/me": {
+      "get": {
+        "summary": "Report the signed-in user's platform identity.",
+        "operationId": "me_api_me_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          }
+        },
+        "description": "Reads the unspoofable X-Forwarded-Email / X-Forwarded-User headers the ingress injects when SSO is enabled. Both are null in local dev, on public paths, and when SSO is off, so this is an identity display, not an access check."
+      }
+    },
+    "/api/config": {
+      "get": {
+        "summary": "Report the configured vision model and what is available in this environment.",
+        "operationId": "config_api_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Config"
+                }
+              }
+            }
+          }
+        },
+        "description": "Tells the UI which OpenRouter model will read screenshots, whether an API key is present, and whether a database is configured so transaction history can be stored at all."
+      }
+    },
+    "/api/analyze": {
+      "post": {
+        "summary": "Read a bank screenshot and propose which balance cell to update.",
+        "description": "Sends the image to an OpenRouter vision model, returns the signed transactions, warns about duplicates already applied, and locates candidate balance cells in the supplied workbook. Writes nothing and changes nothing.",
+        "operationId": "analyze_api_analyze_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_analyze_api_analyze_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyzeResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/apply": {
+      "post": {
+        "summary": "Append the confirmed transactions to a balance cell and return the workbook.",
+        "description": "Resolves the target cell, folds the signed amounts into its formula (for example =1310.25 becomes =1310.25+203.73-172.32), and returns the patched .xlsx/.xlsm with every other part of the archive preserved byte-for-byte. The change is also echoed in X-Cell / X-Formula-Before / X-Formula-After / X-Delta headers.",
+        "operationId": "apply_api_apply_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_apply_api_apply_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The patched workbook, downloaded as an attachment.",
+            "headers": {
+              "X-Cell": {
+                "description": "The cell that was changed, as Sheet!A1.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Formula-Before": {
+                "description": "The formula before the change.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Formula-After": {
+                "description": "The formula after the change.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Delta": {
+                "description": "The signed sum that was applied.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment filename for the download.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/vnd.ms-excel.sheet.macroEnabled.12": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The workbook could not be read, or there is nothing to apply.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No row in the workbook matches the account label."
+          },
+          "409": {
+            "description": "The label matches more than one row; a cell must be chosen explicitly."
+          },
+          "413": {
+            "description": "The workbook or screenshot exceeds the size limit."
+          }
+        }
+      }
+    },
+    "/api/history": {
+      "get": {
+        "summary": "List recent analyze/apply runs.",
+        "operationId": "get_history_api_history_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "description": "A lightweight audit trail of what was applied, newest first. Never contains the workbook or the screenshot."
+      }
+    },
+    "/api/insights": {
+      "get": {
+        "summary": "Detect recurring bills and project the balance forward.",
+        "description": "Groups stored transactions into repeating series (subscriptions, rent, salary), flags ones expected but not seen, and projects the daily balance over the horizon. Returns ready=false with a reason when there is not enough history to be worth projecting.",
+        "operationId": "get_insights_api_insights_get",
+        "parameters": [
+          {
+            "name": "balance",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Balance"
+            }
+          },
+          {
+            "name": "currency",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "SGD",
+              "title": "Currency"
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Account"
+            }
+          },
+          {
+            "name": "horizon_days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 45,
+              "title": "Horizon Days"
+            }
+          },
+          {
+            "name": "as_of",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "As Of"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InsightsResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/affordability": {
+      "post": {
+        "summary": "Answer whether a purchase fits, judged on the whole projection.",
+        "description": "Re-runs the forecast with the purchase inserted on its date and reads the lowest point of the planned curve, so commitments landing before the purchase date are accounted for. Returns yes / tight / no with an explanation.",
+        "operationId": "post_affordability_api_affordability_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AffordabilityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AffordabilityResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ledger/import": {
+      "post": {
+        "summary": "Parse a transactions CSV, optionally storing it.",
+        "description": "Detects the date / description / amount columns (or separate debit and credit columns), reports per-line problems, and stores the rows only when commit is true. Rows already stored are skipped by fingerprint, so re-importing overlapping history is a no-op.",
+        "operationId": "import_csv_api_ledger_import_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_import_csv_api_ledger_import_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ledger/rows": {
+      "post": {
+        "summary": "Add transactions by hand.",
+        "description": "Adds rows to the caller's history without a CSV \u2014 for cash purchases or history typed in manually. Rows that duplicate existing ones are skipped.",
+        "operationId": "add_rows_api_ledger_rows_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LedgerAddRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ledger": {
+      "get": {
+        "summary": "List stored transactions, newest first.",
+        "operationId": "list_ledger_api_ledger_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "currency",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Currency"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LedgerList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "description": "The transactions the recurring list and forecast are computed from, scoped to the signed-in user."
+      },
+      "delete": {
+        "summary": "Erase the caller's stored transactions.",
+        "description": "Deletes every ledger row belonging to the signed-in user and reports how many were removed. Screenshots and workbooks were never stored, so nothing else to erase.",
+        "operationId": "clear_ledger_api_ledger_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClearResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AffordabilityRequest": {
+        "properties": {
+          "amount": {
+            "type": "string",
+            "title": "Amount"
+          },
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "balance": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Balance"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "default": "SGD"
+          },
+          "cushion": {
+            "type": "string",
+            "title": "Cushion",
+            "default": "0"
+          },
+          "horizon_days": {
+            "type": "integer",
+            "title": "Horizon Days",
+            "default": 45
+          }
+        },
+        "type": "object",
+        "required": [
+          "amount"
+        ],
+        "title": "AffordabilityRequest"
+      },
+      "AffordabilityResult": {
+        "properties": {
+          "verdict": {
+            "type": "string",
+            "title": "Verdict"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          },
+          "amount": {
+            "type": "string",
+            "title": "Amount"
+          },
+          "date": {
+            "type": "string",
+            "title": "Date"
+          },
+          "cushion": {
+            "type": "string",
+            "title": "Cushion"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "low": {
+            "$ref": "#/components/schemas/LowPoint"
+          },
+          "end_balance": {
+            "type": "string",
+            "title": "End Balance"
+          },
+          "start_balance": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Balance"
+          },
+          "forecast": {
+            "$ref": "#/components/schemas/ForecastOut"
+          }
+        },
+        "type": "object",
+        "required": [
+          "verdict",
+          "reason",
+          "amount",
+          "date",
+          "cushion",
+          "currency",
+          "low",
+          "end_balance",
+          "forecast"
+        ],
+        "title": "AffordabilityResult"
+      },
+      "AnalyzeResult": {
+        "properties": {
+          "account_hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Hint"
+          },
+          "transactions": {
+            "items": {
+              "$ref": "#/components/schemas/Tx"
+            },
+            "type": "array",
+            "title": "Transactions"
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/Candidate"
+            },
+            "type": "array",
+            "title": "Candidates"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "duplicates": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Duplicates"
+          },
+          "total": {
+            "type": "string",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "transactions",
+          "candidates",
+          "total"
+        ],
+        "title": "AnalyzeResult"
+      },
+      "BalanceInfo": {
+        "properties": {
+          "supplied": {
+            "type": "boolean",
+            "title": "Supplied"
+          },
+          "amount": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          }
+        },
+        "type": "object",
+        "required": [
+          "supplied"
+        ],
+        "title": "BalanceInfo"
+      },
+      "Body_analyze_api_analyze_post": {
+        "properties": {
+          "screenshot": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Screenshot"
+          },
+          "workbook_file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Workbook File"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "default": "UOB One"
+          }
+        },
+        "type": "object",
+        "required": [
+          "screenshot",
+          "workbook_file"
+        ],
+        "title": "Body_analyze_api_analyze_post"
+      },
+      "Body_apply_api_apply_post": {
+        "properties": {
+          "screenshot": {
+            "anyOf": [
+              {
+                "type": "string",
+                "contentMediaType": "application/octet-stream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screenshot"
+          },
+          "workbook_file": {
+            "anyOf": [
+              {
+                "type": "string",
+                "contentMediaType": "application/octet-stream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workbook File"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "default": "UOB One"
+          },
+          "sheet": {
+            "type": "string",
+            "title": "Sheet",
+            "default": ""
+          },
+          "cell": {
+            "type": "string",
+            "title": "Cell",
+            "default": ""
+          },
+          "rows_json": {
+            "type": "string",
+            "title": "Rows Json",
+            "default": ""
+          },
+          "compact": {
+            "type": "boolean",
+            "title": "Compact",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "Body_apply_api_apply_post"
+      },
+      "Body_import_csv_api_ledger_import_post": {
+        "properties": {
+          "file": {
+            "anyOf": [
+              {
+                "type": "string",
+                "contentMediaType": "application/octet-stream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text",
+            "default": ""
+          },
+          "account": {
+            "type": "string",
+            "title": "Account",
+            "default": "Unassigned"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "default": "SGD"
+          },
+          "commit": {
+            "type": "boolean",
+            "title": "Commit",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "Body_import_csv_api_ledger_import_post"
+      },
+      "Candidate": {
+        "properties": {
+          "sheet": {
+            "type": "string",
+            "title": "Sheet"
+          },
+          "cell": {
+            "type": "string",
+            "title": "Cell"
+          },
+          "label_cell": {
+            "type": "string",
+            "title": "Label Cell"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "formula": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Formula"
+          },
+          "raw_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Value"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sheet",
+          "cell",
+          "label_cell",
+          "label"
+        ],
+        "title": "Candidate"
+      },
+      "ClearResult": {
+        "properties": {
+          "deleted": {
+            "type": "integer",
+            "title": "Deleted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "deleted"
+        ],
+        "title": "ClearResult"
+      },
+      "Config": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "has_api_key": {
+            "type": "boolean",
+            "title": "Has Api Key"
+          },
+          "history_enabled": {
+            "type": "boolean",
+            "title": "History Enabled"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model",
+          "provider",
+          "has_api_key",
+          "history_enabled"
+        ],
+        "title": "Config"
+      },
+      "Coverage": {
+        "properties": {
+          "first": {
+            "type": "string",
+            "title": "First"
+          },
+          "last": {
+            "type": "string",
+            "title": "Last"
+          },
+          "days": {
+            "type": "integer",
+            "title": "Days"
+          },
+          "transactions": {
+            "type": "integer",
+            "title": "Transactions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "first",
+          "last",
+          "days",
+          "transactions"
+        ],
+        "title": "Coverage"
+      },
+      "ForecastOut": {
+        "properties": {
+          "start": {
+            "type": "string",
+            "title": "Start"
+          },
+          "end": {
+            "type": "string",
+            "title": "End"
+          },
+          "horizon_days": {
+            "type": "integer",
+            "title": "Horizon Days"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "start_balance": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Balance"
+          },
+          "low": {
+            "$ref": "#/components/schemas/LowPoint"
+          },
+          "end_balance": {
+            "type": "string",
+            "title": "End Balance"
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/Point"
+            },
+            "type": "array",
+            "title": "Points"
+          },
+          "assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Assumptions"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "confidence_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Confidence Reasons"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "horizon_days",
+          "currency",
+          "low",
+          "end_balance",
+          "points",
+          "assumptions"
+        ],
+        "title": "ForecastOut"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "Health": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "Health"
+      },
+      "HistoryEntry": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "actor": {
+            "type": "string",
+            "title": "Actor"
+          },
+          "action": {
+            "type": "string",
+            "title": "Action"
+          },
+          "sheet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sheet"
+          },
+          "cell": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cell"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "actor",
+          "action",
+          "count"
+        ],
+        "title": "HistoryEntry"
+      },
+      "HistoryResult": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/HistoryEntry"
+            },
+            "type": "array",
+            "title": "Entries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "entries"
+        ],
+        "title": "HistoryResult"
+      },
+      "ImportResult": {
+        "properties": {
+          "committed": {
+            "type": "boolean",
+            "title": "Committed"
+          },
+          "parsed": {
+            "type": "integer",
+            "title": "Parsed"
+          },
+          "added": {
+            "type": "integer",
+            "title": "Added"
+          },
+          "skipped": {
+            "type": "integer",
+            "title": "Skipped"
+          },
+          "errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Errors"
+          },
+          "columns": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Columns"
+          },
+          "rows_preview": {
+            "items": {
+              "$ref": "#/components/schemas/RowIn"
+            },
+            "type": "array",
+            "title": "Rows Preview"
+          }
+        },
+        "type": "object",
+        "required": [
+          "committed",
+          "parsed",
+          "added",
+          "skipped"
+        ],
+        "title": "ImportResult"
+      },
+      "InsightsResult": {
+        "properties": {
+          "ready": {
+            "type": "boolean",
+            "title": "Ready"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "coverage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Coverage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "balance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BalanceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "recurring": {
+            "items": {
+              "$ref": "#/components/schemas/RecurringItem"
+            },
+            "type": "array",
+            "title": "Recurring"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/MoneySummary"
+          },
+          "forecast": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ForecastOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ready",
+          "currency",
+          "summary"
+        ],
+        "title": "InsightsResult"
+      },
+      "LedgerAddRequest": {
+        "properties": {
+          "account": {
+            "type": "string",
+            "title": "Account",
+            "default": "Unassigned"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "default": "SGD"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/RowIn"
+            },
+            "type": "array",
+            "title": "Rows"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows"
+        ],
+        "title": "LedgerAddRequest"
+      },
+      "LedgerList": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/LedgerRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows",
+          "total"
+        ],
+        "title": "LedgerList"
+      },
+      "LedgerRow": {
+        "properties": {
+          "date": {
+            "type": "string",
+            "title": "Date"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "amount": {
+            "type": "string",
+            "title": "Amount"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "account": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "type": "object",
+        "required": [
+          "date",
+          "amount"
+        ],
+        "title": "LedgerRow"
+      },
+      "LowPoint": {
+        "properties": {
+          "date": {
+            "type": "string",
+            "title": "Date"
+          },
+          "balance": {
+            "type": "string",
+            "title": "Balance"
+          }
+        },
+        "type": "object",
+        "required": [
+          "date",
+          "balance"
+        ],
+        "title": "LowPoint"
+      },
+      "Me": {
+        "properties": {
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User"
+          }
+        },
+        "type": "object",
+        "title": "Me"
+      },
+      "MoneySummary": {
+        "properties": {
+          "monthly_income": {
+            "type": "string",
+            "title": "Monthly Income"
+          },
+          "monthly_spend": {
+            "type": "string",
+            "title": "Monthly Spend"
+          },
+          "monthly_net": {
+            "type": "string",
+            "title": "Monthly Net"
+          },
+          "daily_burn": {
+            "type": "string",
+            "title": "Daily Burn"
+          },
+          "months": {
+            "type": "integer",
+            "title": "Months"
+          }
+        },
+        "type": "object",
+        "required": [
+          "monthly_income",
+          "monthly_spend",
+          "monthly_net",
+          "daily_burn",
+          "months"
+        ],
+        "title": "MoneySummary"
+      },
+      "Point": {
+        "properties": {
+          "date": {
+            "type": "string",
+            "title": "Date"
+          },
+          "balance": {
+            "type": "string",
+            "title": "Balance"
+          }
+        },
+        "type": "object",
+        "required": [
+          "date",
+          "balance"
+        ],
+        "title": "Point"
+      },
+      "RecurringItem": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "direction": {
+            "type": "string",
+            "title": "Direction"
+          },
+          "cadence": {
+            "type": "string",
+            "title": "Cadence"
+          },
+          "interval_days": {
+            "type": "integer",
+            "title": "Interval Days"
+          },
+          "amount": {
+            "type": "string",
+            "title": "Amount"
+          },
+          "occurrences": {
+            "type": "integer",
+            "title": "Occurrences"
+          },
+          "last_seen": {
+            "type": "string",
+            "title": "Last Seen"
+          },
+          "next_expected": {
+            "type": "string",
+            "title": "Next Expected"
+          },
+          "days_until": {
+            "type": "integer",
+            "title": "Days Until"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "missed": {
+            "type": "boolean",
+            "title": "Missed"
+          },
+          "confidence": {
+            "type": "string",
+            "title": "Confidence"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "title",
+          "direction",
+          "cadence",
+          "interval_days",
+          "amount",
+          "occurrences",
+          "last_seen",
+          "next_expected",
+          "days_until",
+          "status",
+          "missed",
+          "confidence",
+          "currency"
+        ],
+        "title": "RecurringItem"
+      },
+      "RowIn": {
+        "properties": {
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description",
+            "default": ""
+          },
+          "amount": {
+            "type": "string",
+            "title": "Amount"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          }
+        },
+        "type": "object",
+        "required": [
+          "amount"
+        ],
+        "title": "RowIn"
+      },
+      "Tx": {
+        "properties": {
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "amount": {
+            "type": "string",
+            "title": "Amount"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint"
+          }
+        },
+        "type": "object",
+        "required": [
+          "description",
+          "amount"
+        ],
+        "title": "Tx"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "Same origin"
+    }
+  ]
+}

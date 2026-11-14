@@ -1,0 +1,14 @@
+# Build output and dependencies — never upload these (the deploy zip is source-only).
+node_modules/
+dist/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Substrait local state (holds the project↔app link)
+.substrait/
+
+# Local env files
+.env
+.env.local
